@@ -1,6 +1,6 @@
 from typing import List, Optional
 from pydantic import BaseModel
-from .models import Book, AuditLog, BookIn_Pydantic
+from app.models import Book, AuditLog
 import json
 
 # Commands
@@ -17,7 +17,7 @@ class UpdateBookCommand(BaseModel):
     content: Optional[str] = None
     user_id: Optional[str] = None
 
-from .rag import embeddings
+from app.rag import embeddings
 from tortoise import Tortoise
 
 # Handlers

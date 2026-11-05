@@ -1,6 +1,5 @@
 from typing import Annotated, TypedDict, List
 from langgraph.graph import StateGraph, END
-from langchain_huggingface import HuggingFacePipeline
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 import os
 import torch
@@ -8,13 +7,14 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from .rag import search_similar_books
+from app.rag import search_similar_books
 
 # Define the state for the graph
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], lambda x, y: x + y]
     context: str
     book_id: str # Added book_id to state
+    human_required: bool
 
 # ... (LLM initialization remains same)
 # Using a mock or conditional loading for tests to avoid heavy downloads
@@ -31,7 +31,8 @@ try:
         # we'll use a local fallback using the model's generate method directly.
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
         from langchain_core.language_models.llms import LLM
-        from typing import Any, Optional
+        from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+        from typing import Any, Optional, List
 
         model_id = os.getenv("LLM_MODEL_ID", "google/flan-t5-large")
         print(f"Loading model: {model_id}...")
@@ -43,7 +44,13 @@ try:
             print("Model loaded successfully.")
 
             class LocalT5LLM(LLM):
-                def _call(self, prompt: str, stop: Optional[list] = None, **kwargs: Any) -> str:
+                def _call(
+                    self,
+                    prompt: str,
+                    stop: Optional[List] = None,
+                    run_manager: Optional[CallbackManagerForLLMRun] = None,
+                    **kwargs: Any,
+                ) -> str:
                     inputs = tokenizer(prompt, return_tensors="pt")
                     # Move to GPU if available
                     if torch.cuda.is_available():
@@ -94,6 +101,13 @@ async def retrieve(state: AgentState):
     return {"context": context}
 
 def assistant(state: AgentState):
+    last_message = state["messages"][-1].content.lower()
+    if "human" in last_message or "help" in last_message:
+        return {
+            "messages": [AIMessage(content="I'm connecting you with a human assistant. Please wait.")],
+            "human_required": True
+        }
+    
     system_prompt = f"You are a book assistant. Use the following context to answer: {state.get('context', '')}"
     messages = [HumanMessage(content=system_prompt)] + state["messages"]
     print(f"Invoking LLM with {len(messages)} messages. LLM type: {type(llm)}")
@@ -101,7 +115,7 @@ def assistant(state: AgentState):
     # Ensure response is an AIMessage
     if isinstance(res, str):
         res = AIMessage(content=res)
-    return {"messages": [res]}
+    return {"messages": [res], "human_required": False}
 
 # Build the graph
 workflow = StateGraph(AgentState)

@@ -1,11 +1,11 @@
-import os
 import asyncio
+import os
+
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
 from tortoise import Tortoise
-from .models import Book
 
 from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -31,9 +31,11 @@ async def init_vector_extension():
     conn = Tortoise.get_connection("default")
     # Enable pgvector extension
     await conn.execute_script("CREATE EXTENSION IF NOT EXISTS vector;")
-    # Add vector column to books table if it doesn't exist (Self-healing part)
+    # Ensure vector column is correctly typed (Self-healing part)
     # all-MiniLM-L6-v2 dimensions = 384
     try:
+        # Check if vector column exists, if not aerich should have created it as TextField
+        # We try to alter it to vector type if it exists
         await conn.execute_script("ALTER TABLE books ALTER COLUMN vector TYPE vector(384) USING vector::vector(384);")
     except Exception as e:
         print(f"Vector column alteration: {e}")

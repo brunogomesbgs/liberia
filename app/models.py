@@ -22,6 +22,7 @@ class BaseModel(models.Model):
 class User(BaseModel):
     username = fields.CharField(max_length=50, unique=True)
     password_hash = fields.CharField(max_length=128)
+    role = fields.CharField(max_length=20, default="standard") # "admin" or "standard"
     
     class Meta:
         table = "users"
@@ -45,7 +46,29 @@ class AuditLog(BaseModel):
     class Meta:
         table = "audit_logs"
 
+class ChatSession(BaseModel):
+    user = fields.ForeignKeyField("models.User", related_name="chat_sessions")
+    book = fields.ForeignKeyField("models.Book", related_name="chat_sessions", null=True)
+    is_human_required = fields.BooleanField(default=False)
+    sentiment = fields.CharField(max_length=50, null=True)
+    is_active = fields.BooleanField(default=True)
+
+    class Meta:
+        table = "chat_sessions"
+
+class ChatMessage(BaseModel):
+    session = fields.ForeignKeyField("models.ChatSession", related_name="messages")
+    sender_type = fields.CharField(max_length=20) # "user", "agent", "admin"
+    content = fields.TextField()
+    user = fields.ForeignKeyField("models.User", related_name="chat_messages", null=True)
+    feedback = fields.CharField(max_length=10, null=True) # "up", "down"
+
+    class Meta:
+        table = "chat_messages"
+
 User_Pydantic = pydantic_model_creator(User, name="User")
-UserIn_Pydantic = pydantic_model_creator(User, name="UserIn", exclude_readonly=True)
+UserIn_Pydantic = pydantic_model_creator(User, name="UserIn", exclude_readonly=True, optional=("password_hash",))
 Book_Pydantic = pydantic_model_creator(Book, name="Book")
 BookIn_Pydantic = pydantic_model_creator(Book, name="BookIn", exclude_readonly=True)
+ChatSession_Pydantic = pydantic_model_creator(ChatSession, name="ChatSession")
+ChatMessage_Pydantic = pydantic_model_creator(ChatMessage, name="ChatMessage")
