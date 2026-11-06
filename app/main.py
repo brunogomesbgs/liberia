@@ -1,18 +1,46 @@
 from pydantic import BaseModel as PydanticBaseModel
 from typing import List, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Header, Request
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    Depends,
+    HTTPException,
+    status,
+    Header,
+    Request,
+    UploadFile,
+    File,
+    Form,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from tortoise.contrib.fastapi import register_tortoise
-from app.models import User, User_Pydantic, Book, ChatSession, ChatMessage, ChatSession_Pydantic
+from tortoise.functions import Count
+from tortoise.expressions import Q
+from app.models import (
+    User,
+    User_Pydantic,
+    Book,
+    BookChunk,
+    ChatSession,
+    ChatMessage,
+    ChatSession_Pydantic,
+)
 from app.tortoise_config import TORTOISE_ORM
 from app.auth import verify_password, get_password_hash, create_access_token, decode_access_token
 from app.agent import agent_app
 from app.sentiment import analyze_sentiment
-from app.rag import init_vector_extension
+from app.rag import init_vector_extension, _validate_uuid
+from app.evaluation import get_online_evaluation_summary, run_retrieval_benchmark
 from aerich import Command
-from app.cqrs import BookCommandHandler, BookQueryHandler, CreateBookCommand
-from langchain_core.messages import HumanMessage
+from app.cqrs import (
+    BookCommandHandler,
+    BookQueryHandler,
+    CreateBookCommand,
+    UpdateBookCommand,
+)
+from langchain_core.messages import HumanMessage, AIMessage
 from dotenv import load_dotenv
 import os
 import json
@@ -50,7 +78,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-load_dotenv(override=True)
+load_dotenv(override=False)
 
 app = FastAPI(title="Liberia Agentic Book Reader")
 
@@ -64,12 +92,13 @@ app.add_middleware(
 )
 
 # Tortoise ORM configuration (Self-healing strategy with Aerich)
-register_tortoise(
-    app,
-    config=TORTOISE_ORM,
-    generate_schemas=True,
-    add_exception_handlers=True,
-)
+if os.getenv("TESTING") != "1":
+    register_tortoise(
+        app,
+        config=TORTOISE_ORM,
+        generate_schemas=True,
+        add_exception_handlers=True,
+    )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -119,6 +148,10 @@ async def create_user(request: Request, x_origin: Optional[str] = Header(None)):
     if not username or not password:
          raise HTTPException(status_code=422, detail="Username and Password are required")
 
+    existing_user = await User.get_or_none(username=username)
+    if existing_user:
+        return await User_Pydantic.from_tortoise_orm(existing_user)
+
     user_obj = await User.create(
         username=username,
         password_hash=get_password_hash(password),
@@ -131,11 +164,111 @@ async def list_books(user: User = Depends(get_current_user)):
     books = await BookQueryHandler.list_books(user_id=str(user.id))
     return books
 
+@app.get("/books/{book_id}")
+async def get_book(book_id: str, user: User = Depends(get_current_user)):
+    try:
+        validated_id = _validate_uuid(book_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid book ID")
+    book = await BookQueryHandler.get_book(
+        validated_id,
+        user_id=None if user.role == "admin" else str(user.id),
+    )
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    return book
+
+@app.get("/books/{book_id}/chunks")
+async def get_book_chunks(book_id: str, user: User = Depends(get_current_user)):
+    try:
+        validated_id = _validate_uuid(book_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid book ID")
+    book = await BookQueryHandler.get_book(
+        validated_id,
+        user_id=None if user.role == "admin" else str(user.id),
+    )
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    chunks = await BookQueryHandler.list_book_chunks(validated_id)
+    return [
+        {
+            "id": str(c.id),
+            "book_id": str(c.book_id),
+            "chunk_index": c.chunk_index,
+            "chapter": c.chapter,
+            "page_number": c.page_number,
+            "token_count": c.token_count,
+            "content": c.content,
+        }
+        for c in chunks
+    ]
+
 @app.post("/books")
 async def create_book(book_in: CreateBookCommand, user: User = Depends(get_current_user)):
     book_in.user_id = str(user.id)
     book = await BookCommandHandler.create_book(book_in)
     return book
+
+@app.post("/books/upload")
+async def upload_book(
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    author: Optional[str] = Form(None),
+    user: User = Depends(get_current_user),
+):
+    filename = file.filename or "uploaded_book.txt"
+    allowed_exts = (".pdf", ".epub", ".txt", ".md", ".markdown")
+    if not filename.lower().endswith(allowed_exts):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format. Allowed formats: {', '.join(allowed_exts)}",
+        )
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    book = await BookCommandHandler.ingest_uploaded_book(
+        file_bytes=file_bytes,
+        filename=filename,
+        title=title,
+        author=author,
+        user_id=str(user.id),
+    )
+    return book
+
+class UpdateBookPayload(PydanticBaseModel):
+    title: Optional[str] = None
+    author: Optional[str] = None
+    content: Optional[str] = None
+
+@app.put("/books/{book_id}")
+async def update_book(
+    book_id: str,
+    payload: UpdateBookPayload,
+    user: User = Depends(get_current_user),
+):
+    try:
+        validated_id = _validate_uuid(book_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid book ID")
+    existing = await BookQueryHandler.get_book(
+        validated_id,
+        user_id=None if user.role == "admin" else str(user.id),
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    cmd_data = {"id": validated_id, "user_id": str(user.id)}
+    if payload.title is not None:
+        cmd_data["title"] = payload.title
+    if payload.author is not None:
+        cmd_data["author"] = payload.author
+    if payload.content is not None:
+        cmd_data["content"] = payload.content
+
+    updated = await BookCommandHandler.update_book(UpdateBookCommand(**cmd_data))
+    return updated
 
 @app.get("/admin/users")
 async def admin_list_users(user: User = Depends(require_admin)):
@@ -143,20 +276,52 @@ async def admin_list_users(user: User = Depends(require_admin)):
 
 @app.get("/admin/books")
 async def admin_list_books(user: User = Depends(require_admin)):
-    return await Book.all()
+    return await Book.all().order_by("-created_at")
 
 @app.get("/admin/chats/requested")
 async def list_requested_chats(user: User = Depends(require_admin)):
-    sessions = await ChatSession.filter(is_human_required=True, is_active=True).prefetch_related('book').order_by("-created_at")
+    sessions = (
+        await ChatSession.filter(is_human_required=True, is_active=True)
+        .annotate(
+            evaluation_count=Count(
+                "messages",
+                _filter=Q(messages__feedback__not_isnull=True),
+            )
+        )
+        .prefetch_related("book")
+        .order_by("-created_at")
+    )
     result = []
     for s in sessions:
-        eval_count = await ChatMessage.filter(session=s, feedback__isnull=False).count()
         session_data = await ChatSession_Pydantic.from_tortoise_orm(s)
-        session_dict = session_data.dict()
-        session_dict["evaluation_count"] = eval_count
+        session_dict = (
+            session_data.model_dump()
+            if hasattr(session_data, "model_dump")
+            else session_data.dict()
+        )
+        session_dict["evaluation_count"] = getattr(s, "evaluation_count", 0)
         session_dict["book_title"] = s.book.title if s.book else "General Chat"
         result.append(session_dict)
     return result
+
+class BenchmarkRequest(PydanticBaseModel):
+    k: int = 5
+    book_id: Optional[str] = None
+    max_samples: int = 10
+
+@app.get("/admin/evaluation/summary")
+async def admin_evaluation_summary(user: User = Depends(require_admin)):
+    return await get_online_evaluation_summary()
+
+@app.post("/admin/evaluation/benchmark")
+async def admin_evaluation_benchmark(
+    req: Optional[BenchmarkRequest] = None,
+    user: User = Depends(require_admin),
+):
+    k = req.k if req else 5
+    book_id = req.book_id if req else None
+    max_samples = req.max_samples if req else 10
+    return await run_retrieval_benchmark(k=k, book_id=book_id, max_samples=max_samples)
 
 @app.websocket("/chat")
 async def websocket_endpoint(websocket: WebSocket, bookId: str = None):
@@ -178,18 +343,32 @@ async def websocket_endpoint(websocket: WebSocket, bookId: str = None):
             return
 
         await websocket.send_text("Authenticated")
-        
-        # Create or get active session
-        session = await ChatSession.filter(user=user, book=await Book.get_or_none(id=bookId) if bookId else None, is_active=True).order_by("-created_at").first()
+
+        validated_book_id = None
+        book_obj = None
+        if bookId:
+            try:
+                validated_book_id = _validate_uuid(bookId)
+                book_obj = await Book.get_or_none(id=validated_book_id)
+            except ValueError:
+                validated_book_id = None
+                book_obj = None
+
+        # Create or get active session (single DB lookup for book_obj)
+        session = (
+            await ChatSession.filter(user=user, book=book_obj, is_active=True)
+            .order_by("-created_at")
+            .first()
+        )
         if not session:
-            session = await ChatSession.create(user=user, book=await Book.get_or_none(id=bookId) if bookId else None)
+            session = await ChatSession.create(user=user, book=book_obj)
         
         session_id_val = str(session.id)
         # Clear any existing connections for this session first to avoid ghosts
         if session_id_val in manager.active_connections:
             try:
                 await manager.active_connections[session_id_val].close()
-            except:
+            except Exception:
                 pass
         manager.active_connections[session_id_val] = websocket
         
@@ -199,17 +378,30 @@ async def websocket_endpoint(websocket: WebSocket, bookId: str = None):
             # Check if it's feedback
             try:
                 payload = json.loads(data)
-                if payload.get("type") == "feedback":
+                if isinstance(payload, dict) and payload.get("type") == "feedback":
+                    msg_id = payload.get("messageId")
                     msg_index = payload.get("messageIndex")
+                    total_client_msgs = payload.get("totalMessages")
                     feedback_val = payload.get("feedback")
-                    
-                    # Find the message by index in this session
-                    # The UI sends the index of the message in the current local messages array
-                    messages = await ChatMessage.filter(session=session).order_by("created_at")
-                    if 0 <= msg_index < len(messages):
-                        target_msg = messages[msg_index]
+
+                    target_msg = None
+                    if msg_id:
+                        target_msg = await ChatMessage.get_or_none(id=msg_id, session=session)
+                    elif isinstance(msg_index, int):
+                        messages = await ChatMessage.filter(session=session).order_by("created_at")
+                        if (
+                            isinstance(total_client_msgs, int)
+                            and 0 < total_client_msgs <= len(messages)
+                            and 0 <= msg_index < total_client_msgs
+                        ):
+                            window = messages[-total_client_msgs:]
+                            target_msg = window[msg_index]
+                        elif 0 <= msg_index < len(messages):
+                            target_msg = messages[msg_index]
+
+                    if target_msg is not None:
                         target_msg.feedback = feedback_val
-                        await target_msg.save()
+                        await target_msg.save(update_fields=["feedback", "updated_at"])
                         print(f"DEBUG: Feedback updated for message {target_msg.id}: {feedback_val}")
                     continue
             except (json.JSONDecodeError, TypeError):
@@ -219,33 +411,55 @@ async def websocket_endpoint(websocket: WebSocket, bookId: str = None):
             # Save user message
             await ChatMessage.create(session=session, sender_type="user", content=data, user=user)
 
-            # If human is already required, don't invoke agent
+            # Refresh session state from DB to see if an admin cleared is_human_required
             await session.refresh_from_db()
             if session.is_human_required:
                 print(f"DEBUG: Session {session.id} is already flagged for human. Skipping agent.")
                 await websocket.send_text("Human assistant has been notified. They will respond shortly.")
                 continue
 
-            # Invoke LangGraph agent
+            # Load recent conversation history for stateful multi-turn context
+            recent_db_msgs = (
+                await ChatMessage.filter(session=session)
+                .order_by("-created_at")
+                .limit(6)
+            )
+            history_messages = [
+                HumanMessage(content=m.content)
+                if m.sender_type == "user"
+                else AIMessage(content=m.content)
+                for m in reversed(recent_db_msgs)
+            ]
+            if not history_messages:
+                history_messages = [HumanMessage(content=data)]
+
+            # Invoke LangGraph agent with tenant user_id & conversation history
             response = await agent_app.ainvoke({
-                "messages": [HumanMessage(content=data)],
-                "book_id": bookId,
-                "human_required": False
+                "messages": history_messages,
+                "book_id": validated_book_id,
+                "user_id": str(user.id),
+                "human_required": False,
             })
             
             last_msg = response["messages"][-1]
             content = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
             
-            # Save agent message
-            await ChatMessage.create(session=session, sender_type="agent", content=content)
+            # Save agent message with retrieval telemetry
+            await ChatMessage.create(
+                session=session,
+                sender_type="agent",
+                content=content,
+                retrieved_chunk_ids=response.get("retrieved_chunk_ids"),
+                top_similarity_score=response.get("top_similarity_score"),
+            )
             
             # Update human requested status
             if response.get("human_required"):
                 session.is_human_required = True
                 
-                # Perform sentiment analysis on the whole session
-                all_messages = await ChatMessage.filter(session=session).order_by("created_at")
-                message_contents = [m.content for m in all_messages]
+                # Perform sentiment analysis on recent session messages
+                all_messages = await ChatMessage.filter(session=session).order_by("-created_at").limit(50)
+                message_contents = [m.content for m in reversed(all_messages)]
                 session.sentiment = analyze_sentiment(message_contents)
                 
                 await session.save()
@@ -296,6 +510,11 @@ async def admin_websocket_endpoint(websocket: WebSocket, session_id: str):
             data = await websocket.receive_text()
             # Save admin message
             await ChatMessage.create(session=session, sender_type="admin", content=data, user=user)
+            # Clear is_human_required lock when admin responds via WebSocket
+            await session.refresh_from_db()
+            if session.is_human_required:
+                session.is_human_required = False
+                await session.save(update_fields=["is_human_required", "updated_at"])
             # Notify the user's websocket here.
             await manager.send_personal_message(data, session_id, sender="admin")
             await websocket.send_text(f"Admin sent: {data}")
@@ -321,6 +540,8 @@ async def admin_respond(session_id: str, response: AdminResponse, user: User = D
 
 @app.on_event("startup")
 async def startup():
+    if os.getenv("TESTING") == "1":
+        return
     # Self-healing database: Run migrations
     try:
         command = Command(tortoise_config=TORTOISE_ORM, app="models")
